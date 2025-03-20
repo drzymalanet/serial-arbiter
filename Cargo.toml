@@ -1,0 +1,15 @@
+[package]
+name = "serial-arbiter"
+version = "0.1.0"
+authors = ["Marcin Drzymala"]
+license = "MIT"
+keywords = ["serial", "serialport", "tty", "usb", "driver"]
+categories = ["hardware-support", "network-programming", "os"]
+description = "Serial Port Arbiter - Manages serial port access and ensures it recovers from failures"
+repository = "https://github.com/drzymalanet/serial-arbiter"
+readme = "README.md"
+edition = "2021"
+
+[dependencies]
+crossbeam = { version = "0.8.4", default-features = false, features = ["std"] }
+serialport = { version = "4.7.0", default-features = false }
