@@ -1,75 +1,91 @@
-use std::{io, sync::Mutex, time::Instant};
+use std::{
+    fs::File,
+    io::{self, ErrorKind},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
-use crossbeam::channel::Sender;
+use crate::serial_port::port_open;
+
+const DEFAULT_COOLOFF_DURATION: Duration = Duration::from_secs(1);
 
 pub struct Connection {
-    state: Mutex<ConnectionState>,
+    inner: Mutex<ConnectionInner>,
 }
 
-pub struct WriteRequest {
-    pub data: Vec<u8>,
-    pub deadline: Instant,
-    pub response: Sender<io::Result<()>>,
-}
-
-pub struct ReadRequest {
-    pub deadline: Instant,
-    pub response: Sender<io::Result<Vec<u8>>>,
-}
-
-enum ConnectionState {
-    Closed,
-    Open {
-        write_channel: Sender<WriteRequest>,
-        read_channel: Sender<ReadRequest>,
-    },
-    Broken(io::Error),
+struct ConnectionInner {
+    path: Option<PathBuf>,
+    file: Option<Arc<Mutex<File>>>,
+    last_conn_attempt: Option<Instant>,
+    cool_time: Option<Duration>,
 }
 
 impl Connection {
-    pub fn new_closed() -> Self {
-        let state = ConnectionState::Closed;
+    pub fn new() -> Self {
+        let state = ConnectionInner {
+            path: None,
+            file: None,
+            last_conn_attempt: None,
+            cool_time: Some(DEFAULT_COOLOFF_DURATION),
+        };
         Self {
-            state: Mutex::new(state),
+            inner: Mutex::new(state),
         }
+    }
+
+    pub fn open(&self) -> io::Result<Arc<Mutex<File>>> {
+        let mut state = self.inner.lock().unwrap();
+        // Skip if already open
+        if let Some(file) = &state.file {
+            return Ok(file.clone());
+        }
+        // Skip if cool-off ongoing
+        if let Some(cool_time) = state.cool_time {
+            if let Some(last_conn) = state.last_conn_attempt {
+                if Instant::now() < last_conn + cool_time {
+                    return Err(ErrorKind::QuotaExceeded.into());
+                }
+            }
+            state.last_conn_attempt = Some(Instant::now());
+        }
+        // Try to open
+        match &state.path {
+            None => Err(ErrorKind::InvalidFilename.into()),
+            Some(path) => match port_open(path) {
+                Ok(file) => {
+                    let file = Arc::new(Mutex::new(file));
+                    state.file = Some(file.clone());
+                    state.last_conn_attempt = None;
+                    Ok(file)
+                }
+                Err(err) => Err(err),
+            },
+        }
+    }
+
+    pub fn close(&self) {
+        let mut state = self.inner.lock().unwrap();
+        state.last_conn_attempt = None;
+        state.file = None;
+    }
+
+    pub fn set_path(&self, path: impl AsRef<Path>) {
+        let mut state = self.inner.lock().unwrap();
+        state.path = Some(path.as_ref().into());
+        state.file = None;
     }
 
     pub fn is_open(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        matches!(*state, ConnectionState::Open { .. })
+        let state = self.inner.lock().unwrap();
+        state.file.is_some()
     }
 
-    pub fn set_open(&self, write_channel: Sender<WriteRequest>, read_channel: Sender<ReadRequest>) {
-        let mut state = self.state.lock().unwrap();
-        *state = ConnectionState::Open {
-            write_channel,
-            read_channel,
-        };
-    }
-
-    pub fn set_closed(&self) {
-        let mut state = self.state.lock().unwrap();
-        *state = ConnectionState::Closed;
-    }
-
-    pub fn set_broken(&self, reason: io::Error) {
-        let mut state = self.state.lock().unwrap();
-        *state = ConnectionState::Broken(reason);
-    }
-
-    pub fn get_write_channel(&self) -> io::Result<Sender<WriteRequest>> {
-        match &*self.state.lock().unwrap() {
-            ConnectionState::Closed => Err(io::ErrorKind::NotConnected.into()),
-            ConnectionState::Broken(err) => Err(err.kind().into()),
-            ConnectionState::Open { write_channel, .. } => Ok(write_channel.clone()),
-        }
-    }
-
-    pub fn get_read_channel(&self) -> io::Result<Sender<ReadRequest>> {
-        match &*self.state.lock().unwrap() {
-            ConnectionState::Closed => Err(io::ErrorKind::NotConnected.into()),
-            ConnectionState::Broken(err) => Err(err.kind().into()),
-            ConnectionState::Open { read_channel, .. } => Ok(read_channel.clone()),
-        }
+    /// Change the duration of cooloff after disconnecting due to an error
+    /// and before a new connection attempt is made. If set to None then
+    /// another connect attepmpt is tried without any artificial delays.
+    pub fn set_cooloff_duration(&self, cooloff: Option<Duration>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.cool_time = cooloff;
     }
 }

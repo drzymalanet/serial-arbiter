@@ -1,6 +1,6 @@
 [package]
 name = "serial-arbiter"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Marcin Drzymala"]
 license = "MIT"
 keywords = ["serial", "serialport", "tty", "usb", "driver"]
@@ -12,4 +12,11 @@ edition = "2021"
 
 [dependencies]
 crossbeam = { version = "0.8.4", default-features = false, features = ["std"] }
-serialport = { version = "4.7.0", default-features = false }
+nix = { version = "0.29.0", default-features = false, features = [
+    "fs",
+    "poll",
+] }
+termios = "0.3.3"
+
+[dev-dependencies]
+serde_json = "1.0.140"

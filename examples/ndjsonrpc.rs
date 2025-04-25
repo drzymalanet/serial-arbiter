@@ -1,27 +1,31 @@
-use std::io;
-use serialport::*;
+use serde_json::json;
 use serial_arbiter::*;
+use std::io;
 use std::time::*;
 
 fn main() -> io::Result<()> {
-    let cfg = serialport::new("/dev/ttyACM0", 115200)
-        .data_bits(DataBits::Eight)
-        .parity(Parity::None)
-        .stop_bits(StopBits::One)
-        .flow_control(FlowControl::None)
-        .timeout(Duration::from_millis(0));
+    // Connect
+    let port = Arbiter::new();
+    port.open("/dev/ttyACM0")?;
 
-    let port = Arbiter::new(cfg);
-
-    let request = format!("{}\n", r#"{"jsonrpc":"2.0","id":777,"method":"hello_world","params":"Hello World!"}"#);
+    // Make a deadline
     let deadline = Instant::now() + Duration::from_millis(10);
+
+    // Transmit request
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": "hello_world",
+        "params": "Hello world!",
+        "id": 777,
+    }).to_string() + "\n";
     print!("\nSending request:\n{request}");
-    port.write_str(request, deadline)?;
+    port.transmit_str(request, deadline)?;
 
-    let deadline = Instant::now() + Duration::from_millis(10);
+    // Receive response
     println!("\nWaiting for response...");
-    let response = port.read_string(deadline)?.unwrap_or("<EMPTY>".to_string());
-    println!("Response: {response}\n");
+    while let Ok(Some(response)) = port.receive_string(Some(0xa), Some(deadline)) {
+        println!("Got response:\n{response}");
+    }
 
     Ok(())
 }

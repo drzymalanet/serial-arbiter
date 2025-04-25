@@ -1,284 +1,333 @@
 mod connection;
+mod serial_port;
 
-use connection::{Connection, ReadRequest, WriteRequest};
-use crossbeam::channel::{bounded, unbounded, SendError, TryRecvError};
-use serialport::{ClearBuffer, SerialPort, SerialPortBuilder};
+use connection::Connection;
+use crossbeam::channel::{bounded, Receiver, RecvTimeoutError, SendError, Sender};
+use serial_port::{port_recv, port_send};
+use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{io, thread};
+use std::{io, mem, thread};
 
-pub const POLLING_INTERVAL: Duration = Duration::from_micros(100);
+pub const POLLING_INTERVAL: Duration = Duration::from_millis(1);
 
 /// # Serial Port Arbiter
 ///
-/// This is a wrapper for `serialport` lib which adds the following features:
-/// 1. Prevents deadlocks caused by input buffer starvation
-/// 2. Prevents data garbling by implementing transaction queueing
-/// 3. Handles gracefully interrupts and timeout errors
-/// 4. Handles gracefully connection errors and automatically reconnects
-/// 5. Provides a more convenient API than the raw io::Read and io::Write
+/// This is a Linux-only serial port library that offers the following benefits
+/// over directly using `/dev/tty`:
+/// 1. Opens the `/dev/tty` file with flags for non-blocking access.
+/// 2. Sets the `termios` flags to use the TTY in raw mode.
+/// 3. Prevents deadlocks caused by input buffer starvation.
+/// 4. Prevents data garbling by implementing transaction arbitration.
+/// 5. Gracefully handles interrupts and timeout errors.
+/// 6. Gracefully handles connection errors and automatically reconnects.
+/// 7. Provides a more convenient API than the raw `io::Read` and `io::Write`.
 ///
-/// **This is an "async-less" library.**
-///
-/// There are two plain old background threads. They are running in parallel.
-/// One is responsible for sending the data to the serial port and the other one
-/// is responsible for the reception of the incomming data from the serial port.
-/// This design ensures that there will be no buffer underruns even when sending
-/// very big messages to the serial port. I.e deadlocks are solved because the
-/// serial port is always ready to accept more data from the slave device.
-///
-/// ## Example
-///
-/// ```
-/// let cfg = serialport::new("/dev/ttyACM0", 4_000_000)
-///     .data_bits(DataBits::Eight)
-///     .parity(Parity::None)
-///     .stop_bits(StopBits::One)
-///     .flow_control(FlowControl::None)
-///     .timeout(Duration::from_millis(0));
-///
-/// let port = Arbiter::new(cfg);
-///
-/// let request = "Hello!\n";
-/// let deadline = Instant::now() + Duration::from_millis(100);
-/// println!("Sending request: {request}");
-/// port.write_str("Hello!", deadline).unwrap();
-///
-/// let deadline = Instant::now() + Duration::from_millis(100);
-/// println!("\nWaiting for response...");
-/// let response = port.read_str(deadline);
-/// println!("Response: {response:?}");
-/// ```
+/// **This is an "async-less" library**, and it is intended to remain that way.  
+/// If you need asynchronous behavior, you can easily make it async-compatible in your own code.
 #[derive(Clone)]
 pub struct Arbiter {
-    bldr: SerialPortBuilder,
     conn: Arc<Connection>,
+    chan: Sender<Request>,
+}
+
+enum Request {
+    Clear(Clear),
+    Transmit(Transmit),
+    Receive(Receive),
+}
+
+struct Clear {
+    pub response: Sender<io::Result<()>>,
+}
+
+struct Transmit {
+    pub tx_bytes: Arc<[u8]>,
+    pub deadline: Instant,
+    pub response: Sender<io::Result<()>>,
+}
+
+struct Receive {
+    pub until: Option<u8>,
+    pub deadline: Option<Instant>,
+    pub response: Sender<io::Result<Option<Vec<u8>>>>,
+}
+
+struct WorkerThread {
+    buff: VecDeque<u8>,
+    conn: Arc<Connection>,
+    chan: Receiver<Request>,
+}
+
+impl Default for Arbiter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Arbiter {
     /// Creates a new arbiter which will handle a serial port
     /// connection defined by the given serial port builder.
-    pub fn new(builder: SerialPortBuilder) -> Self {
-        Self {
-            bldr: builder,
-            conn: Arc::new(Connection::new_closed()),
-        }
+    pub fn new() -> Self {
+        let conn = Arc::new(Connection::new());
+
+        // Setup read and write channels
+        let (req_tx, req_rx) = bounded::<Request>(0);
+
+        // Spawn background thread
+        let worker = WorkerThread::new(conn.clone(), req_rx);
+        worker.spawn();
+
+        Self { conn, chan: req_tx }
     }
 
     /// Closes the serial port
     pub fn close(&self) {
-        self.conn.set_closed();
+        self.conn.close();
+    }
+
+    /// Returns true if the connection is open
+    pub fn is_open(&self) -> bool {
+        self.conn.is_open()
     }
 
     /// Opens the serial port.
-    pub fn open(&self) -> io::Result<()> {
-        // Skip if already open
-        if self.conn.is_open() {
-            return Ok(());
-        }
-
-        // Setup read and write channels
-        let (write_tx, write_rx) = unbounded::<WriteRequest>();
-        let (read_tx, read_rx) = unbounded::<ReadRequest>();
-
-        // Setup two instances of serial port
-        let port_builder = self.bldr.clone();
-        let mut port_rx = port_builder.open()?;
-        let mut port_tx = port_rx
-            .try_clone()
-            .expect("Cloning the SerialPort is required for all this to work.");
-
-        // Spawn reader thread
-        let reader_conn = self.conn.clone();
-        thread::spawn(move || loop {
-            thread::sleep(POLLING_INTERVAL);
-            let request = match read_rx.try_recv() {
-                Err(TryRecvError::Empty) => {
-                    let _ = port_rx.clear(ClearBuffer::Input);
-                    continue;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    return;
-                }
-                Ok(request) => request,
-            };
-            match serial_read(&mut port_rx, request.deadline) {
-                Ok(data) => {
-                    let _ = request.response.try_send(Ok(data));
-                }
-                Err(err) => {
-                    let _ = request.response.try_send(Err(err.kind().into()));
-                    reader_conn.set_broken(err);
-                    return;
-                }
-            }
-        });
-
-        // Spawn the writer thread
-        let writer_conn = self.conn.clone();
-        thread::spawn(move || loop {
-            thread::sleep(POLLING_INTERVAL);
-            let request = match write_rx.recv() {
-                Err(_) => {
-                    let _ = port_tx.clear(ClearBuffer::Output);
-                    return;
-                }
-                Ok(request) => request,
-            };
-            match serial_write(&mut port_tx, request.data, request.deadline) {
-                Ok(()) => {
-                    let _ = request.response.try_send(Ok(()));
-                }
-                Err(err) => {
-                    let _ = request.response.try_send(Err(err.kind().into()));
-                    writer_conn.set_broken(err);
-                    return;
-                }
-            }
-        });
-
-        self.conn.set_open(write_tx, read_tx);
-        Ok(())
+    pub fn open(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.conn.set_path(path);
+        self.conn.open().map(|_| ())
     }
 
-    /// Reads raw data from the serial port.
-    pub fn read(&self, deadline: Instant) -> io::Result<Vec<u8>> {
-        self.open()?;
-        let (response, result) = bounded(1);
-        let request = ReadRequest { deadline, response };
-        let read_channel = self.conn.get_read_channel()?;
-        if let Err(SendError { .. }) = read_channel.send(request) {
-            return Err(io::ErrorKind::ConnectionAborted.into());
+    /// Clear the Rx buffer of the serial port.
+    pub fn clear_rx_buff(&self) -> io::Result<()> {
+        let (response, result_ch) = bounded(1);
+        let request = Request::Clear(Clear { response });
+        if let Err(SendError { .. }) = self.chan.send(request) {
+            return Err(io::Error::other("Internal error"));
         }
-        match result.recv() {
-            Err(_) => Err(io::ErrorKind::ConnectionAborted.into()),
+        match result_ch.recv() {
+            Err(_) => Err(io::Error::other("Internal error")),
             Ok(result) => result,
         }
     }
 
-    /// Reads a string from the serial port.
-    pub fn read_string(&self, deadline: Instant) -> io::Result<Option<String>> {
-        let data = self.read(deadline)?;
-        if !data.is_empty() {
-            let text = String::from_utf8_lossy(&data).to_string();
-            Ok(Some(text))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Writes the given data to the serial port.
-    pub fn write(&self, data: impl AsRef<[u8]>, deadline: Instant) -> io::Result<()> {
-        self.open()?;
-        let data = Vec::from(data.as_ref());
-        let (response, result) = bounded(1);
-        let request = WriteRequest {
-            data,
+    /// Transmits data to the serial port.
+    pub fn transmit(&self, tx_bytes: Arc<[u8]>, deadline: Instant) -> io::Result<()> {
+        let (response, result_ch) = bounded(1);
+        let request = Request::Transmit(Transmit {
+            tx_bytes,
             deadline,
             response,
-        };
-        let write_channel = self.conn.get_write_channel()?;
-        if let Err(SendError { .. }) = write_channel.send(request) {
-            return Err(io::ErrorKind::ConnectionAborted.into());
+        });
+        if let Err(SendError { .. }) = self.chan.send(request) {
+            return Err(io::Error::other("Internal error"));
         }
-        match result.recv() {
-            Err(_) => Err(io::ErrorKind::ConnectionAborted.into()),
+        match result_ch.recv() {
+            Err(_) => Err(io::Error::other("Internal error")),
             Ok(result) => result,
         }
     }
 
-    /// Writes the given text to the serial port.
-    pub fn write_str(&self, text: impl AsRef<str>, deadline: Instant) -> io::Result<()> {
-        self.write(text.as_ref().as_bytes(), deadline)
+    /// Transmits a string to the serial port.
+    /// Returns any bytes received during transmission.
+    pub fn transmit_str(&self, str: impl AsRef<str>, deadline: Instant) -> io::Result<()> {
+        let tx_bytes = str.as_ref().as_bytes().into();
+        self.transmit(tx_bytes, deadline)
+    }
+
+    /// Receives data from the serial port
+    pub fn receive(
+        &self,
+        until: Option<u8>,
+        deadline: Option<Instant>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let (response, result_ch) = bounded(1);
+        let request = Request::Receive(Receive {
+            until,
+            deadline,
+            response,
+        });
+        if let Err(SendError { .. }) = self.chan.send(request) {
+            return Err(io::Error::other("Internal error"));
+        }
+        match result_ch.recv() {
+            Err(_) => Err(io::Error::other("Internal error")),
+            Ok(result) => result,
+        }
+    }
+
+    /// Receives data from the serial port and converts to a String
+    pub fn receive_string(
+        &self,
+        until: Option<u8>,
+        deadline: Option<Instant>,
+    ) -> io::Result<Option<String>> {
+        let result = self.receive(until, deadline)?;
+        Ok(result.map(|x| String::from_utf8_lossy(&x).to_string()))
+    }
+
+    /// Change the duration of cooloff after disconnecting due to an error
+    /// and before a new connection attempt is made. If set to None then
+    /// another connect attepmpt is tried without any artificial delays.
+    pub fn set_cooloff_duration(&self, cooloff: Option<Duration>) {
+        self.conn.set_cooloff_duration(cooloff);
     }
 }
 
-fn serial_read(port: &mut Box<dyn SerialPort>, deadline: Instant) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0; 1024];
-    let mut cnt = 0;
-    loop {
-        if cnt == buf.len() {
-            // Grow the buffer
-            buf.extend([0; 1024]);
+impl WorkerThread {
+    fn new(connection: Arc<Connection>, requests: Receiver<Request>) -> Self {
+        Self {
+            buff: VecDeque::new(),
+            conn: connection,
+            chan: requests,
         }
-        match port.read(&mut buf.as_mut_slice()[cnt..]) {
-            Ok(0) => {
-                // No more data
-                buf.truncate(cnt);
-                return Ok(buf);
-            }
-            Ok(n) => {
-                // Got more data
-                cnt += n;
-                continue;
-            }
-            Err(err) => match err.kind() {
-                io::ErrorKind::Interrupted => {
-                    // Interrupted
-                    continue;
+    }
+
+    fn spawn(mut self) {
+        thread::spawn(move || loop {
+            self.process();
+        });
+    }
+
+    fn process(&mut self) {
+        loop {
+            let request_recv = self.chan.recv_timeout(POLLING_INTERVAL);
+            match request_recv {
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Stop signal
+                    return;
                 }
-                io::ErrorKind::TimedOut => {
-                    if Instant::now() < deadline {
-                        // We ignore the single read timeouts
-                        // and instead we check the total deadline
-                        continue;
-                    } else {
-                        // Deadline reached
-                        buf.truncate(cnt);
-                        return Ok(buf);
+                Err(RecvTimeoutError::Timeout) => {
+                    // Collect incomming data to avoid RX buffer starvation
+                    let _ = self.receive_from_port(None, None);
+                }
+                Ok(request) => match request {
+                    Request::Clear(tx) => {
+                        let result = if self.conn.is_open() {
+                            self.receive_from_port(None, None)
+                        } else {
+                            Ok(())
+                        };
+                        self.buff.clear();
+                        let _ = tx.response.try_send(result);
                     }
-                }
-                _ => {
-                    // I/O Error
-                    return Err(err);
-                }
-            },
+                    Request::Transmit(tx) => {
+                        let result = self.transmit_to_port(tx.tx_bytes, tx.deadline);
+                        let _ = tx.response.try_send(result);
+                    }
+                    Request::Receive(rx) => {
+                        // Check if we can skip reading from port
+                        if let Some(delimiter) = rx.until {
+                            // If we have all needed data
+                            let colltype = CollectKind::UntilOrNothing(delimiter);
+                            if let Some(data) = self.collect_from_buff(colltype) {
+                                // Return the data immediately
+                                let _ = rx.response.try_send(Ok(Some(data)));
+                                continue;
+                            }
+                        }
+
+                        // Receive all new available data from the port
+                        if let Err(err) = self.receive_from_port(rx.until, rx.deadline) {
+                            // Error when receiving data
+                            let _ = rx.response.try_send(Err(err));
+                            continue;
+                        }
+
+                        // Return collected data
+                        let colltype = match rx.until {
+                            None => CollectKind::Everything,
+                            Some(delimiter) => CollectKind::UntilOrEverything(delimiter),
+                        };
+                        let data = self.collect_from_buff(colltype);
+                        let _ = rx.response.try_send(Ok(data));
+                    }
+                },
+            };
         }
+    }
+
+    fn receive_from_port(
+        &mut self,
+        until: Option<u8>,
+        deadline: Option<Instant>,
+    ) -> io::Result<()> {
+        let file_mutex = self.conn.open()?;
+        let mut file = file_mutex.lock().unwrap();
+        let result = port_recv(&mut file, &mut self.buff, until, deadline);
+        if result.is_err() {
+            self.conn.close();
+        }
+        result
+    }
+
+    fn transmit_to_port(&mut self, data: Arc<[u8]>, deadline: Instant) -> io::Result<()> {
+        let file_mutex = self.conn.open()?;
+        let mut file = file_mutex.lock().unwrap();
+        let result = port_send(&mut file, &data, &mut self.buff, deadline);
+        if result.is_err() {
+            self.conn.close();
+        }
+        result
+    }
+
+    /// Collect data from the RX FIFO buffer.
+    fn collect_from_buff(&mut self, collect: CollectKind) -> Option<Vec<u8>> {
+        if self.buff.is_empty() {
+            return None;
+        }
+        match collect {
+            CollectKind::Everything => self.collect_from_buff_everything(),
+            CollectKind::UntilOrEverything(delimiter) => {
+                if let Some(pos) = self.buff.iter().position(|x| x == &delimiter) {
+                    self.collect_from_buff_count(pos + 1)
+                } else {
+                    self.collect_from_buff_everything()
+                }
+            }
+            CollectKind::UntilOrNothing(delimiter) => {
+                if let Some(pos) = self.buff.iter().position(|x| x == &delimiter) {
+                    self.collect_from_buff_count(pos + 1)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Collect the given count of elements from the RX FIFO buffer
+    fn collect_from_buff_count(&mut self, count: usize) -> Option<Vec<u8>> {
+        if self.buff.is_empty() {
+            // Return nothing
+            return None;
+        }
+        if self.buff.len() <= count {
+            return self.collect_from_buff_everything();
+        }
+        // Return part of the buffer
+        let mut data = self.buff.split_off(count);
+        mem::swap(&mut self.buff, &mut data);
+        Some(data.into())
+    }
+
+    /// Collect all data from the RX FIFO buffer
+    fn collect_from_buff_everything(&mut self) -> Option<Vec<u8>> {
+        if self.buff.is_empty() {
+            return None;
+        }
+        let mut data = VecDeque::new();
+        mem::swap(&mut self.buff, &mut data);
+        Some(data.into())
     }
 }
 
-fn serial_write(
-    port: &mut Box<dyn SerialPort>,
-    data: Vec<u8>,
-    deadline: Instant,
-) -> io::Result<()> {
-    let mut cnt = 0;
-    loop {
-        if cnt == data.len() {
-            return Ok(());
-        }
-        match port.write(&data[cnt..]) {
-            Ok(0) => {
-                // Could not write
-                port.flush()?;
-                continue;
-            }
-            Ok(n) => {
-                // Wrote data
-                cnt += n;
-                port.flush()?;
-                continue;
-            }
-            Err(err) => match err.kind() {
-                io::ErrorKind::Interrupted => {
-                    // Interrupted
-                    continue;
-                }
-                io::ErrorKind::TimedOut => {
-                    if Instant::now() < deadline {
-                        // We ignore the single write timeouts
-                        // and instead we check the total deadline
-                        continue;
-                    } else {
-                        // The total transaction deadline is reached
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                }
-                _ => {
-                    // I/O Error
-                    return Err(err);
-                }
-            },
-        }
-    }
+enum CollectKind {
+    /// Consume all data from the buffer
+    Everything,
+    /// Consume all data from the buffer but only until the given byte.
+    /// If the byte is not found then consume the whole buffer.
+    UntilOrEverything(u8),
+    /// Consume data from the buffer but only until the given byte.
+    /// If the byte is not found then do not consume any data from the buffer.
+    UntilOrNothing(u8),
 }
