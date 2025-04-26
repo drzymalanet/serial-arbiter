@@ -1,59 +1,45 @@
 # Serial Port Arbiter
 
-This is a wrapper for `serialport` lib which adds the following features:
-1. Prevents deadlocks caused by input buffer starvation
-2. Prevents data garbling by implementing transaction queueing
-3. Handles gracefully interrupts and timeout errors
-4. Handles gracefully connection errors and automatically reconnects
-5. Provides a more convenient API than the raw io::Read and io::Write
+This is a Linux-only serial port library that offers the following benefits
+over directly using `/dev/tty`:
+1. Opens the `/dev/tty` file with flags for non-blocking access.
+2. Sets the `termios` flags to use the TTY in raw mode.
+3. Prevents deadlocks caused by input buffer starvation.
+4. Prevents data garbling by implementing transaction arbitration.
+5. Gracefully handles interrupts and timeout errors.
+6. Gracefully handles connection errors and automatically reconnects.
+7. Provides a more convenient API than the raw `io::Read` and `io::Write`.
 
-**This is an "async-less" library.**
-
-There are two plain old background threads. They are running in parallel.
-One is responsible for sending the data to the serial port and the other one
-is responsible for the reception of the incomming data from the serial port.
-This design ensures that there will be no buffer underruns even when sending
-very big messages to the serial port. I.e deadlocks are solved because the
-serial port is always ready to accept more data from the slave device.
+**This is an "async-less" library**, and it is intended to remain that way.
+If you need asynchronous behavior, you can easily make it async-compatible in your own code.
 
 ## Example
 
 ```rust
-use std::io;
-use serialport::*;
+use std::{
+    io,
+    time::{Duration, Instant},
+};
+
 use serial_arbiter::*;
-use std::time::*;
 
 fn main() -> io::Result<()> {
-    let cfg = serialport::new("/dev/ttyACM0", 115200)
-        .data_bits(DataBits::Eight)
-        .parity(Parity::None)
-        .stop_bits(StopBits::One)
-        .flow_control(FlowControl::None)
-        .timeout(Duration::from_millis(0));
+    let deadline = Instant::now() + Duration::from_secs(3);
 
-    let port = Arbiter::new(cfg);
+    // Connect
+    let port = Arbiter::new();
+    port.open("/dev/ttyACM0")?;
 
-    let request = format!("{}\n", r#"{"jsonrpc":"2.0","id":777,"method":"hello_world","params":"Hello World!"}"#);
-    let deadline = Instant::now() + Duration::from_millis(10);
-    print!("\nSending request:\n{request}");
-    port.write_str(request, deadline)?;
+    // Transmit request
+    port.transmit_str("Hello world\n", deadline)?;
+    println!("Request sent. Waiting for response...");
 
-    let deadline = Instant::now() + Duration::from_millis(10);
-    println!("\nWaiting for response...");
-    let response = port.read_string(deadline)?.unwrap_or("<EMPTY>".to_string());
-    println!("Response: {response}\n");
+    // Receive response
+    let response = port.receive_string(None, Some(deadline))?;
+    println!("Got response: {response:?}");
 
     Ok(())
 }
 ```
 
-You should be seeing something like this:
-
-```text
-Sending request:
-{"jsonrpc":"2.0","id":777,"method":"hello_world","params":"Hello World!"}
-
-Waiting for response...
-Response: {"jsonrpc":"2.0","error":{"code":32935,"message":"Unknown method"},"id":777}
-```
+Go to the examples directory to see how automatic reconnection is working or how to use jsonrpc.
